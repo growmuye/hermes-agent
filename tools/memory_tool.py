@@ -113,7 +113,15 @@ class MemoryStore:
         Tool responses always reflect this live state.
     """
 
-    def __init__(self, memory_char_limit: int = 2200, user_char_limit: int = 1375):
+    def __init__(
+        self,
+        memory_char_limit: int = 2200,
+        user_char_limit: int = 1375,
+        user_id: str | None = None,
+        db_dir: str | None = None,
+    ):
+        self.user_id = user_id
+        self.db_dir = db_dir
         self.memory_entries: List[str] = []
         self.user_entries: List[str] = []
         self.memory_char_limit = memory_char_limit
@@ -578,6 +586,148 @@ registry.register(
     check_fn=check_memory_requirements,
     emoji="🧠",
 )
+
+
+class SqliteMemoryStore(MemoryStore):
+    """
+    MemoryStore with SQLite backend and user_id isolation.
+
+    Inherits all behavior (add/replace/remove/char limits/scan/nudge/flush
+    logic) from MemoryStore. Only load_from_disk() and save_to_disk() are
+    overridden to use SQLite instead of .md files.
+    """
+
+    def __init__(
+        self,
+        user_id: str,
+        db_dir: str | None = None,
+        memory_char_limit: int = 2200,
+        user_char_limit: int = 1375,
+    ):
+        # SqliteDB needs user_id before super().__init__ so it can be passed
+        # through to _db.replace_all_entries in save_to_disk.
+        self._db = _SqliteDbForMemoryStore(user_id, db_dir)
+        super().__init__(
+            memory_char_limit=memory_char_limit,
+            user_char_limit=user_char_limit,
+            user_id=user_id,
+            db_dir=db_dir,
+        )
+
+    def load_from_disk(self):
+        """Load entries from SQLite (not .md files)."""
+        self.memory_entries = self._db.get_entries(self.user_id, "memory")
+        self.user_entries = self._db.get_entries(self.user_id, "user")
+
+        # Deduplicate entries (preserves order, keeps first occurrence)
+        self.memory_entries = list(dict.fromkeys(self.memory_entries))
+        self.user_entries = list(dict.fromkeys(self.user_entries))
+
+        # Capture frozen snapshot for system prompt injection
+        self._system_prompt_snapshot = {
+            "memory": self._render_block("memory", self.memory_entries),
+            "user": self._render_block("user", self.user_entries),
+        }
+
+    def _reload_target(self, target: str):
+        """Re-read entries from SQLite into in-memory state.
+
+        Called by replace/remove under their file-lock context manager.
+        """
+        fresh = self._db.get_entries(self.user_id, target)
+        self._set_entries(target, fresh)
+
+    @contextmanager
+    def _file_lock(self, path):
+        """No-op file lock -- SQLite handles its own concurrency."""
+        yield  # SQLite uses its own locking, not .lock files
+
+    def save_to_disk(self, target: str):
+        """Persist entries to SQLite (not .md files)."""
+        entries = self._entries_for(target)
+        self._db.replace_all_entries(self.user_id, target, entries)
+
+
+# ---------------------------------------------------------------------------
+# SqliteDB wrapper scoped to memory_tool (avoids importing hermes-lite src/memory)
+# ---------------------------------------------------------------------------
+
+import os
+import sqlite3
+import threading
+
+
+class _SqliteDbForMemoryStore:
+    """SQLite backend for SqliteMemoryStore. WAL mode, thread-safe."""
+
+    def __init__(self, user_id: str, db_dir: str | None = None):
+        self.user_id = user_id
+        if db_dir is None:
+            db_dir = os.path.join(os.path.expanduser("~/.hermes"), "user_memories")
+        self._db_dir = db_dir
+        os.makedirs(self._db_dir, exist_ok=True)
+        self._db_path = os.path.join(self._db_dir, "memory.db")
+        self._lock = threading.RLock()
+        self._init_schema()
+
+    def _get_conn(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self._db_path, timeout=10.0)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def _init_schema(self) -> None:
+        with self._lock:
+            conn = self._get_conn()
+            try:
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS memories (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        user_id TEXT NOT NULL,
+                        target TEXT NOT NULL,
+                        content TEXT NOT NULL,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_memories_user_id ON memories(user_id)"
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_memories_user_target ON memories(user_id, target)"
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+    def get_entries(self, user_id: str, target: str) -> list[str]:
+        with self._lock:
+            conn = self._get_conn()
+            try:
+                cursor = conn.execute(
+                    "SELECT content FROM memories WHERE user_id = ? AND target = ? ORDER BY id",
+                    (user_id, target),
+                )
+                return [row[0] for row in cursor.fetchall()]
+            finally:
+                conn.close()
+
+    def replace_all_entries(self, user_id: str, target: str, entries: list[str]) -> None:
+        """Atomically replace all entries for a user+target."""
+        with self._lock:
+            conn = self._get_conn()
+            try:
+                conn.execute(
+                    "DELETE FROM memories WHERE user_id=? AND target=?",
+                    (user_id, target),
+                )
+                for entry in entries:
+                    conn.execute(
+                        "INSERT INTO memories (user_id, target, content) VALUES (?, ?, ?)",
+                        (user_id, target, entry),
+                    )
+                conn.commit()
+            finally:
+                conn.close()
 
 
 
