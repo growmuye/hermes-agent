@@ -614,6 +614,7 @@ class AIAgent:
         checkpoint_max_snapshots: int = 50,
         pass_session_id: bool = False,
         persist_session: bool = True,
+        memory_provider=None,
     ):
         """
         Initialize the AI Agent.
@@ -1225,11 +1226,19 @@ class AIAgent:
                 self._memory_nudge_interval = int(mem_config.get("nudge_interval", 10))
                 self._memory_flush_min_turns = int(mem_config.get("flush_min_turns", 6))
                 if self._memory_enabled or self._user_profile_enabled:
-                    from tools.memory_tool import MemoryStore
-                    self._memory_store = MemoryStore(
-                        memory_char_limit=mem_config.get("memory_char_limit", 2200),
-                        user_char_limit=mem_config.get("user_char_limit", 1375),
-                    )
+                    if self._user_id:
+                        from tools.memory_tool import SqliteMemoryStore
+                        self._memory_store = SqliteMemoryStore(
+                            user_id=self._user_id,
+                            memory_char_limit=mem_config.get("memory_char_limit", 2200),
+                            user_char_limit=mem_config.get("user_char_limit", 1375),
+                        )
+                    else:
+                        from tools.memory_tool import MemoryStore
+                        self._memory_store = MemoryStore(
+                            memory_char_limit=mem_config.get("memory_char_limit", 2200),
+                            user_char_limit=mem_config.get("user_char_limit", 1375),
+                        )
                     self._memory_store.load_from_disk()
             except Exception:
                 pass  # Memory is optional -- don't break agent init
@@ -1239,7 +1248,38 @@ class AIAgent:
         # Memory provider plugin (external — one at a time, alongside built-in)
         # Reads memory.provider from config to select which plugin to activate.
         self._memory_manager = None
-        if not skip_memory:
+        # --- External memory provider injection ---
+        if memory_provider is not None:
+            from agent.memory_manager import MemoryManager as _MemoryManager
+            self._memory_manager = _MemoryManager()
+            self._memory_manager.add_provider(memory_provider)
+            from hermes_constants import get_hermes_home as _ghh
+            _init_kwargs = {
+                "session_id": self.session_id,
+                "platform": platform or "cli",
+                "hermes_home": str(_ghh()),
+                "agent_context": "primary",
+            }
+            if self._session_db:
+                try:
+                    _st = self._session_db.get_session_title(self.session_id)
+                    if _st:
+                        _init_kwargs["session_title"] = _st
+                except Exception:
+                    pass
+            if self._user_id:
+                _init_kwargs["user_id"] = self._user_id
+            if self._gateway_session_key:
+                _init_kwargs["gateway_session_key"] = self._gateway_session_key
+            try:
+                from hermes_cli.profiles import get_active_profile_name
+                _profile = get_active_profile_name()
+                _init_kwargs["agent_identity"] = _profile
+                _init_kwargs["agent_workspace"] = "hermes"
+            except Exception:
+                pass
+            self._memory_manager.initialize_all(**_init_kwargs)
+        elif not skip_memory:
             try:
                 _mem_provider_name = mem_config.get("provider", "") if mem_config else ""
 
@@ -7334,6 +7374,11 @@ class AIAgent:
                 db=self._session_db,
                 current_session_id=self.session_id,
             )
+        # When built-in _memory_store is None, route to external provider first
+        if (self._memory_store is None
+                and self._memory_manager
+                and self._memory_manager.has_tool(function_name)):
+            return self._memory_manager.handle_tool_call(function_name, function_args)
         elif function_name == "memory":
             target = function_args.get("target", "memory")
             from tools.memory_tool import memory_tool as _memory_tool
@@ -7817,6 +7862,11 @@ class AIAgent:
                 tool_duration = time.time() - tool_start_time
                 if self._should_emit_quiet_tool_messages():
                     self._vprint(f"  {_get_cute_tool_message_impl('session_search', function_args, tool_duration, result=function_result)}")
+            # When built-in _memory_store is None, route to external provider first
+            if (self._memory_store is None
+                    and self._memory_manager
+                    and self._memory_manager.has_tool(function_name)):
+                return self._memory_manager.handle_tool_call(function_name, function_args)
             elif function_name == "memory":
                 target = function_args.get("target", "memory")
                 from tools.memory_tool import memory_tool as _memory_tool
